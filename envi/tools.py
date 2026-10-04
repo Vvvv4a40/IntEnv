@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .cancellation import CancellationToken
-from .configuration import AppSettings
+from .configuration import ALIAS_PATTERN, AppSettings, normalize_aliases
 from .errors import AssistantError
 from .json_utils import strict_json_loads
 from .models import ToolCall
@@ -25,7 +25,6 @@ _BLOCKED_EXECUTABLES = frozenset({
     "cmd.exe", "powershell.exe", "pwsh.exe", "wsl.exe", "bash.exe", "sh.exe",
     "wscript.exe", "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe",
 })
-_ALIAS = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
 
 
 class ToolRegistry:
@@ -33,8 +32,8 @@ class ToolRegistry:
 
     def __init__(self, settings: AppSettings) -> None:
         self._base_directory = Path(settings.base_directory).resolve()
-        self._apps = self._copy_aliases(settings.apps)
-        self._folders = self._copy_aliases(settings.folders)
+        self._apps = normalize_aliases(settings.apps)
+        self._folders = normalize_aliases(settings.folders)
         self._resolved_targets: dict[tuple[str, str], Path] = {}
         self.schemas = [self._schema("get_time", "Получить текущее местное время.")]
         if self._apps:
@@ -69,7 +68,7 @@ class ToolRegistry:
         if property_name is None:
             return None
         alias = arguments[property_name]
-        if not isinstance(alias, str) or not _ALIAS.fullmatch(alias):
+        if not isinstance(alias, str) or not ALIAS_PATTERN.fullmatch(alias):
             return f"Аргумент {property_name} должен быть короткой строкой из разрешённого списка."
         aliases = self._apps if call.name == "open_app" else self._folders
         configured_path = aliases.get(alias.casefold())
@@ -133,19 +132,6 @@ class ToolRegistry:
             return result
         except OSError as error:
             raise AssistantError("Windows не удалось запустить разрешённое действие. Проверь путь и права доступа.") from error
-
-    @staticmethod
-    def _copy_aliases(aliases: dict[str, str]) -> dict[str, str]:
-        if not isinstance(aliases, dict):
-            raise AssistantError("Разрешённые приложения и папки должны быть словарями.")
-        result: dict[str, str] = {}
-        for alias, path in aliases.items():
-            if not isinstance(alias, str) or not _ALIAS.fullmatch(alias) or alias.casefold() in result:
-                raise AssistantError("В списке разрешений есть пустой или повторяющийся псевдоним.")
-            if not isinstance(path, str) or not path.strip():
-                raise AssistantError("В списке разрешений есть пустой путь.")
-            result[alias.casefold()] = path
-        return result
 
     @staticmethod
     def _schema(name: str, description: str, argument: str | None = None,

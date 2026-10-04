@@ -1,5 +1,3 @@
-"""Request orchestration; neither the router nor a cloud model can execute unchecked code."""
-
 from collections.abc import Sequence
 from threading import Lock
 
@@ -44,6 +42,14 @@ class AssistantService:
         token.check()
         while not self._turn_lock.acquire(timeout=0.05):
             token.check()
+        try:
+            answer = self._run_turn(text, confirm, token)
+            self._remember(text, answer)
+            return answer
+        finally:
+            self._turn_lock.release()
+
+    def _run_turn(self, text: str, confirm: Confirmation, token: CancellationToken) -> str:
         completed: list[str] = []
         try:
             token.check()
@@ -52,78 +58,70 @@ class AssistantService:
                 self.events.record("request.route", {"route": "local", "length": len(text)})
                 self._validate(local_call)
                 if not self._approve(local_call, confirm, token):
-                    answer = "Действие отменено."
-                else:
-                    answer = self._execute(local_call, token, completed)
-                self._remember(text, answer)
-                return answer
+                    return "Действие отменено."
+                return self._execute(local_call, token, completed)
 
             self.events.record("request.route", {"route": "groq", "length": len(text)})
-            messages = [ChatMessage("system", _SYSTEM_PROMPT), *self.get_history_snapshot(),
-                        ChatMessage("user", text)]
-            executed_batches = 0
-            used_ids: set[str] = set()
-            executed_actions: set[str] = set()
-            while True:
-                token.check()
-                reply = self.model.complete(tuple(messages), self.tools.schemas, token)
-                token.check()
-                self.events.record("model.completed", {"toolCount": len(reply.tool_calls), "round": executed_batches})
-                if reply.finish_reason == "length":
-                    raise AssistantError("Ответ модели обрезан лимитом токенов. Действия из этого ответа не выполнялись; упрости запрос.")
-                if not reply.tool_calls:
-                    if not reply.content or not reply.content.strip():
-                        raise AssistantError("Модель не вернула ответ. Попробуй уточнить запрос.")
-                    answer = self._with_completed(reply.content, completed)
-                    self._remember(text, answer)
-                    return answer
-                if executed_batches >= self.settings.max_tool_rounds:
-                    raise AssistantError("Достигнут лимит цепочки инструментов. Последний набор действий не выполнен.")
-                if len(reply.tool_calls) > 5:
-                    raise AssistantError("Модель предложила слишком много действий сразу. Набор не выполнен.")
-
-                # Validate the entire batch before any approval or side effect.
-                batch_actions: set[str] = set()
-                for call in reply.tool_calls:
-                    self._validate(call)
-                    if not isinstance(call.id, str) or not call.id.strip() or len(call.id) > 200 or call.id in used_ids:
-                        raise AssistantError("Модель вернула некорректный или повторный ID инструмента. Набор не выполнен.")
-                    used_ids.add(call.id)
-                    signature = self._signature(call)
-                    if self.tools.requires_confirmation(call):
-                        if signature in batch_actions or signature in executed_actions:
-                            raise AssistantError("Модель повторно предложила то же действие. Повтор не выполнен.")
-                        batch_actions.add(signature)
-
-                # Declining the last item must leave this whole batch unexecuted.
-                for call in reply.tool_calls:
-                    if not self._approve(call, confirm, token):
-                        answer = self._with_completed("Действие отменено.", completed)
-                        self._remember(text, answer)
-                        return answer
-                messages.append(ChatMessage("assistant", reply.content, tool_calls=tuple(reply.tool_calls)))
-                for call in reply.tool_calls:
-                    result = self._execute(call, token, completed)
-                    executed_actions.add(self._signature(call))
-                    messages.append(ChatMessage("tool", result, tool_call_id=call.id))
-                executed_batches += 1
+            return self._run_model(text, confirm, token, completed)
         except CancelledError:
             if not completed:
                 raise
-            answer = self._with_completed("Запрос отменён. Уже запущенные действия не откатываются.", completed)
-            self._remember(text, answer)
-            return answer
+            return self._with_completed("Запрос отменён. Уже запущенные действия не откатываются.", completed)
         except Exception as error:
             if not completed:
                 if isinstance(error, AssistantError):
                     raise
                 raise AssistantError("Ошибка обработки запроса. Дальнейшие действия остановлены.") from error
-            reason = str(error) if isinstance(error, AssistantError) else "Ошибка локального инструмента."
-            answer = self._with_completed("Не удалось завершить запрос: " + reason, completed)
-            self._remember(text, answer)
-            return answer
-        finally:
-            self._turn_lock.release()
+            reason = str(error) if isinstance(error, AssistantError) else "Ошибка обработки запроса."
+            return self._with_completed("Не удалось завершить запрос: " + reason, completed)
+
+    def _run_model(self, text: str, confirm: Confirmation, token: CancellationToken,
+                   completed: list[str]) -> str:
+        messages = [ChatMessage("system", _SYSTEM_PROMPT), *self.get_history_snapshot(),
+                    ChatMessage("user", text)]
+        executed_batches = 0
+        used_ids: set[str] = set()
+        executed_actions: set[str] = set()
+        while True:
+            token.check()
+            reply = self.model.complete(tuple(messages), self.tools.schemas, token)
+            token.check()
+            self.events.record("model.completed", {"toolCount": len(reply.tool_calls), "round": executed_batches})
+            if reply.finish_reason == "length":
+                raise AssistantError("Ответ модели обрезан лимитом токенов. Действия из этого ответа не выполнялись; упрости запрос.")
+            if not reply.tool_calls:
+                if not reply.content or not reply.content.strip():
+                    raise AssistantError("Модель не вернула ответ. Попробуй уточнить запрос.")
+                return self._with_completed(reply.content, completed)
+            if executed_batches >= self.settings.max_tool_rounds:
+                raise AssistantError("Достигнут лимит цепочки инструментов. Последний набор действий не выполнен.")
+            batch_actions = self._validate_batch(reply.tool_calls, used_ids, executed_actions)
+            for call in reply.tool_calls:
+                if not self._approve(call, confirm, token):
+                    return self._with_completed("Действие отменено.", completed)
+            messages.append(ChatMessage("assistant", reply.content, tool_calls=reply.tool_calls))
+            for call in reply.tool_calls:
+                result = self._execute(call, token, completed)
+                messages.append(ChatMessage("tool", result, tool_call_id=call.id))
+            executed_actions.update(batch_actions)
+            executed_batches += 1
+
+    def _validate_batch(self, calls: Sequence[ToolCall], used_ids: set[str],
+                        executed_actions: set[str]) -> set[str]:
+        if len(calls) > 5:
+            raise AssistantError("Модель предложила слишком много действий сразу. Набор не выполнен.")
+        batch_actions: set[str] = set()
+        for call in calls:
+            self._validate(call)
+            if not isinstance(call.id, str) or not call.id.strip() or len(call.id) > 200 or call.id in used_ids:
+                raise AssistantError("Модель вернула некорректный или повторный ID инструмента. Набор не выполнен.")
+            used_ids.add(call.id)
+            if self.tools.requires_confirmation(call):
+                signature = self._signature(call)
+                if signature in batch_actions or signature in executed_actions:
+                    raise AssistantError("Модель повторно предложила то же действие. Повтор не выполнен.")
+                batch_actions.add(signature)
+        return batch_actions
 
     def _validate(self, call: ToolCall) -> None:
         error = self.tools.validate(call)
@@ -146,7 +144,7 @@ class AssistantService:
         token.check()
         self._validate(call)
         self.events.record("tool.proposed", {"name": call.name})
-        result = self.tools.execute(call, token)  # The registry also revalidates before an OS call.
+        result = self.tools.execute(call, token)
         if self.tools.requires_confirmation(call):
             completed.append(result)
         self.events.record("tool.executed", {"name": call.name})

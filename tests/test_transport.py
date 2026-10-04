@@ -98,6 +98,24 @@ class TransportTests(unittest.TestCase):
         self.socket.shutdown.assert_called_once()
         self.assert_timer_cleaned()
 
+    def test_timer_expiry_during_connect_never_uploads_request(self):
+        self.connection.connect.side_effect = lambda: self.timers[0].fire()
+        with self.assertRaises(AssistantError) as caught:
+            self.send()
+        self.assertIn("вовремя", str(caught.exception))
+        self.connection.request.assert_not_called()
+        self.connection.getresponse.assert_not_called()
+        self.assert_timer_cleaned()
+
+    def test_total_deadline_expired_after_connect_never_uploads_request(self):
+        with patch("envi.providers.groq.time.monotonic", side_effect=[10.0, 10.1, 41.0]):
+            with self.assertRaises(AssistantError) as caught:
+                self.send()
+        self.assertIn("вовремя", str(caught.exception))
+        self.connection.request.assert_not_called()
+        self.connection.getresponse.assert_not_called()
+        self.assert_timer_cleaned()
+
     def test_timer_expiry_during_request_closes_socket_and_has_no_retry(self):
         def request(*args, **kwargs):
             self.timers[0].fire()
@@ -124,10 +142,46 @@ class TransportTests(unittest.TestCase):
         self.assert_timer_cleaned()
 
     def test_total_deadline_expired_after_upload_stops_before_response(self):
-        with patch("envi.providers.groq.time.monotonic", side_effect=[10.0, 10.1, 41.0]):
+        with patch("envi.providers.groq.time.monotonic", side_effect=[10.0, 10.1, 10.2, 41.0]):
             with self.assertRaises(AssistantError):
                 self.send()
         self.connection.getresponse.assert_not_called()
+        self.assertEqual(1, self.connection.request.call_count)
+        self.assert_timer_cleaned()
+
+    def test_timer_expiry_at_response_end_is_not_accepted_as_success(self):
+        def read_chunk(size):
+            self.timers[0].fire()
+            return b""
+
+        self.response.read1.side_effect = read_chunk
+        with self.assertRaises(AssistantError) as caught:
+            self.send()
+        self.assertIn("вовремя", str(caught.exception))
+        self.response.close.assert_called_once_with()
+        self.assert_timer_cleaned()
+
+    def test_cancellation_at_response_end_is_not_accepted_as_success(self):
+        def read_chunk(size):
+            self.token.cancel()
+            return b""
+
+        self.response.read1.side_effect = read_chunk
+        with self.assertRaises(CancelledError):
+            self.send()
+        self.response.close.assert_called_once_with()
+        self.assert_timer_cleaned()
+
+    def test_response_is_closed_after_success(self):
+        self.send()
+        self.response.close.assert_called_once_with()
+
+    def test_oversized_response_is_closed_without_retry(self):
+        self.response.read1.side_effect = [b"x" * 1_048_577]
+        with self.assertRaises(AssistantError) as caught:
+            self.send()
+        self.assertIn("размер", str(caught.exception))
+        self.response.close.assert_called_once_with()
         self.assertEqual(1, self.connection.request.call_count)
         self.assert_timer_cleaned()
 

@@ -1,10 +1,12 @@
 """Desktop/audio tests using hidden Tk widgets and fake WinMM, never real devices or APIs."""
 
 import ctypes
+import gc
 import struct
 import threading
 import time
 import unittest
+import weakref
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -88,6 +90,11 @@ class FakeWinMM:
 
 
 class AudioTests(unittest.TestCase):
+    def setUp(self):
+        retained = patch.object(audio, "_unreleased_sessions", [])
+        retained.start()
+        self.addCleanup(retained.stop)
+
     def test_wav_header_and_even_pcm_alignment(self):
         wav = audio._wav_bytes(b"\x01\x00\xff")
         header = struct.unpack("<4sI4s4sIHHIIHH4sI", wav[:44])
@@ -173,6 +180,38 @@ class AudioTests(unittest.TestCase):
                 with self.subTest(limit=limit), self.assertRaises(ValueError):
                     audio.WaveRecorder().start(limit)
         self.assertEqual([], native.operations)
+
+    def test_worker_start_failure_does_not_block_the_next_recording(self):
+        native, kernel = FakeWinMM(), FakeKernel()
+        with patch.object(audio, "_winmm", native), patch.object(audio, "_kernel32", kernel):
+            recorder = audio.WaveRecorder()
+            with patch("envi.audio.threading.Thread.start", side_effect=RuntimeError("Fake thread failure")):
+                with self.assertRaises(RuntimeError):
+                    recorder.start(1)
+            self.assertIsNone(recorder._current)
+            self.assertFalse(recorder.is_recording)
+            self.assertEqual([], native.operations)
+            self.assertEqual(b"RIFF", recorder.start(1).result(timeout=2)[:4])
+
+    def test_failed_cleanup_retains_buffers_after_recorder_is_collected(self):
+        gate = threading.Event()
+        native, kernel = FakeWinMM(open_gate=gate, cleanup_failure=True), FakeKernel()
+        with patch.object(audio, "_winmm", native), patch.object(audio, "_kernel32", kernel):
+            recorder = audio.WaveRecorder()
+            completion = recorder.start(1)
+            try:
+                self.assertTrue(native.entered.wait(1))
+                recorder.cancel()
+            finally:
+                gate.set()
+            with self.assertRaises(OSError):
+                completion.result(timeout=2)
+            session_ref = weakref.ref(recorder._current)
+            del recorder, completion
+            gc.collect()
+            self.assertIsNotNone(session_ref())
+            self.assertIn(session_ref(), audio._unreleased_sessions)
+            self.assertEqual([], kernel.closed)
 
 
 class FakeRecorder:
@@ -345,9 +384,66 @@ class DesktopTests(unittest.TestCase):
         # keep this a memory-boundary test, not a pathological Tk layout test.
         self.window._add_history("Вы", "x\n" * 40_000)
         self.window._add_history("Envi", "y\n" * 40_000)
+        self.window._add_history("Вы", "Новый запрос после сокращения истории")
         history = self.window.history_box.get("1.0", "end-1c")
         self.assertLess(len(history), 100_000)
-        self.assertIn("предыдущие сообщения скрыты", history)
+        self.assertEqual(1, history.count("предыдущие сообщения скрыты"))
+        self.assertIn("Новый запрос после сокращения истории", history)
+
+    def test_history_appends_without_rebuilding_existing_messages(self):
+        with patch.object(self.window.history_box, "delete", wraps=self.window.history_box.delete) as delete:
+            self.window._add_history("Вы", "Первый запрос")
+            self.window._add_history("Envi", "Первый ответ")
+            delete.assert_not_called()
+        history = self.window.history_box.get("1.0", "end-1c")
+        self.assertEqual(1, history.count("Первый запрос"))
+        self.assertEqual(1, history.count("Первый ответ"))
+        self.assertEqual(self.window._history_size, len(history))
+
+    def test_worker_start_failure_restores_controls_and_allows_retry(self):
+        with patch("envi.ui.threading.Thread.start", side_effect=RuntimeError("Fake thread failure")):
+            self.send("Первый запрос")
+        self.wait_until(lambda: self.window._kind is None)
+        self.assertEqual([], self.assistant.calls)
+        self.assertEqual("normal", str(self.window.send_button["state"]))
+        self.assertIn("Не удалось запустить обработку", self.window.history_box.get("1.0", "end"))
+        self.send("Который час?")
+        self.wait_until(lambda: self.window._kind is None)
+        self.assertEqual(["Который час?"], self.assistant.calls)
+
+    def test_confirmation_creation_failure_denies_action_and_keeps_polling(self):
+        self.assistant.mode = "confirmation"
+        with patch("envi.ui.tk.Toplevel", side_effect=tk.TclError("Fake dialog failure")):
+            self.send("Открой блокнот")
+            self.wait_until(lambda: self.window._kind is None)
+        self.assertFalse(self.assistant.approved)
+        self.assertTrue(self.assistant.finished.is_set())
+        self.assertIsNone(self.window._dialog)
+        self.assertIn("Действие не выполнено", self.window.history_box.get("1.0", "end"))
+        self.assertIsNotNone(self.window._after_id)
+
+    def test_confirmation_setup_failure_closes_partial_dialog(self):
+        self.assistant.mode = "confirmation"
+        self.original_toplevel = tk.Toplevel
+        dialogs = []
+
+        def fail_grab():
+            raise tk.TclError("Fake grab failure")
+
+        def failing_dialog(*args, **kwargs):
+            dialog = self.hidden_dialog(*args, **kwargs)
+            dialog.grab_set = fail_grab
+            dialog.grab_release = fail_grab
+            dialogs.append(dialog)
+            return dialog
+
+        with patch("envi.ui.tk.Toplevel", side_effect=failing_dialog):
+            self.send("Открой блокнот")
+            self.wait_until(lambda: self.window._kind is None)
+        self.assertFalse(self.assistant.approved)
+        self.assertIsNone(self.window._dialog)
+        self.assertIsNone(self.window._dialog_request)
+        self.assertFalse(dialogs[0].winfo_exists())
 
     def test_worker_cannot_directly_mutate_tk_status(self):
         failures = []

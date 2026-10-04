@@ -8,7 +8,7 @@ from pathlib import Path
 
 from envi.cancellation import CancellationToken
 from envi.configuration import AppSettings
-from envi.errors import AssistantError, CancelledError
+from envi.errors import AssistantError
 from envi.event_log import JsonEventLog
 from envi.assistant import AssistantService
 from envi.providers.groq import GroqClient, HttpResponse
@@ -76,39 +76,23 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(AssistantError):
                 AppSettings.load(Path(directory) / "missing.json")
 
-
-class CancellationTests(unittest.TestCase):
-    def test_registered_callbacks_fire_once_and_unregister_works(self):
-        token = CancellationToken()
-        calls = []
-        token.register(lambda: calls.append("kept"))
-        unregister = token.register(lambda: calls.append("removed"))
-        unregister()
-        token.cancel()
-        token.cancel()
-        self.assertEqual(["kept"], calls)
-        self.assertTrue(token.is_cancelled)
-        with self.assertRaises(CancelledError):
-            token.check()
-
-    def test_registration_after_cancel_runs_immediately(self):
-        token = CancellationToken()
-        token.cancel()
-        calls = []
-        token.register(lambda: calls.append("closed"))
-        self.assertEqual(["closed"], calls)
-
-    def test_failing_cleanup_does_not_prevent_other_cleanups(self):
-        token = CancellationToken()
-        calls = []
-
-        def fail():
-            raise OSError("fake socket close failure")
-
-        token.register(fail)
-        token.register(lambda: calls.append("closed"))
-        token.cancel()
-        self.assertEqual(["closed"], calls)
+    def test_settings_and_registry_apply_the_same_alias_validation(self):
+        invalid_aliases = (
+            None,
+            [],
+            {"unsafe name": "app.exe"},
+            {"same": "a.exe", "SAME": "b.exe"},
+            {"app": None},
+            {42: "app.exe"},
+        )
+        for field in ("apps", "folders"):
+            for aliases in invalid_aliases:
+                with self.subTest(field=field, aliases=aliases):
+                    settings = AppSettings(**{field: aliases})
+                    with self.assertRaises(AssistantError):
+                        settings.validate()
+                    with self.assertRaises(AssistantError):
+                        ToolRegistry(settings)
 
 
 class EventLogTests(unittest.TestCase):
@@ -137,6 +121,26 @@ class EventLogTests(unittest.TestCase):
             log = JsonEventLog(blocker / "events.jsonl")
             log.record("request.route", {"length": 4})
             self.assertIsNotNone(log.last_error)
+
+    def test_nonfinite_metadata_is_excluded_from_standard_json(self):
+        with tempfile.TemporaryDirectory(prefix="envi-tests-") as directory:
+            path = Path(directory) / "events.jsonl"
+            log = JsonEventLog(path)
+            log.record("model.completed", {"length": float("nan"), "toolCount": float("inf"),
+                                           "round": float("-inf"), "name": "get_time"})
+            self.assertEqual({"name": "get_time"}, json.loads(path.read_text(encoding="utf-8"))["data"])
+            self.assertIsNone(log.last_error)
+
+    def test_encoding_failure_is_nonfatal_and_the_next_event_recovers(self):
+        with tempfile.TemporaryDirectory(prefix="envi-tests-") as directory:
+            path = Path(directory) / "events.jsonl"
+            log = JsonEventLog(path)
+            log.record("request.route", {"route": "\ud800"})
+            self.assertIsNotNone(log.last_error)
+            log.record("request.route", {"route": "local", "length": 4})
+            self.assertIsNone(log.last_error)
+            self.assertEqual({"route": "local", "length": 4},
+                             json.loads(path.read_text(encoding="utf-8"))["data"])
 
     def test_full_request_pipeline_does_not_log_key_prompt_or_answer(self):
         with tempfile.TemporaryDirectory(prefix="envi-tests-") as directory:

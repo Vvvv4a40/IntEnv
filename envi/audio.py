@@ -116,6 +116,10 @@ class _Session:
     prepared: bool = False
 
 
+_unreleased_sessions: list[_Session] = []
+_unreleased_sessions_lock = threading.Lock()
+
+
 class WaveRecorder:
     """One recording at a time. ``stop``/``cancel`` signal and return a Future.
 
@@ -154,8 +158,12 @@ class WaveRecorder:
             capacity = _BYTES_PER_SECOND * maximum_seconds
             session = _Session(capacity, maximum_seconds)
             self._current = session
-            threading.Thread(target=self._wait_and_finish, args=(session,),
-                             name="EnviWaveRecorder", daemon=True).start()
+            try:
+                threading.Thread(target=self._wait_and_finish, args=(session,),
+                                 name="EnviWaveRecorder", daemon=True).start()
+            except Exception:
+                self._current = None
+                raise
             return session.completion
 
     def stop(self) -> Future[bytes]:
@@ -236,6 +244,9 @@ class WaveRecorder:
             cleanup_error, released = self._release_native(session, reset_first=error is not None)
             if error is None:
                 error = cleanup_error
+            if not released:
+                with _unreleased_sessions_lock:
+                    _unreleased_sessions.append(session)
             with self._lock:
                 if released:
                     if session.event_handle and not _kernel32.CloseHandle(

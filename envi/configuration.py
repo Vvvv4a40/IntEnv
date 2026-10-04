@@ -7,6 +7,26 @@ from .errors import AssistantError
 from .json_utils import strict_json_loads
 
 
+ALIAS_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
+
+
+def normalize_aliases(aliases: dict[str, str]) -> dict[str, str]:
+    if not isinstance(aliases, dict):
+        raise AssistantError("Разрешённые приложения и папки должны быть объектами JSON.")
+    normalized: dict[str, str] = {}
+    for alias, path in aliases.items():
+        if (
+            not isinstance(alias, str)
+            or not ALIAS_PATTERN.fullmatch(alias)
+            or not isinstance(path, str)
+            or not path.strip()
+            or alias.casefold() in normalized
+        ):
+            raise AssistantError("В списках разрешений нужны уникальные короткие имена и непустые пути.")
+        normalized[alias.casefold()] = path
+    return normalized
+
+
 @dataclass
 class AppSettings:
     chat_model: str = "openai/gpt-oss-20b"
@@ -31,7 +51,6 @@ class AppSettings:
             raw = strict_json_loads(full_path.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 raise AssistantError("Настройки должны быть объектом JSON.")
-            # Accept the old CamelCase keys too, but reject aliases supplied twice.
             names = {f.name.replace("_", "").casefold(): f.name for f in fields(cls) if f.name != "base_directory"}
             kwargs: dict[str, Any] = {}
             for key, value in raw.items():
@@ -64,11 +83,4 @@ class AppSettings:
             if type(value) is not int or not minimum <= value <= maximum:
                 raise AssistantError(f"Некорректный лимит {name}: допустимо {minimum}–{maximum}.")
         for aliases in (self.apps, self.folders):
-            if not isinstance(aliases, dict):
-                raise AssistantError("Разрешённые приложения и папки должны быть объектами JSON.")
-            seen: set[str] = set()
-            for key, value in aliases.items():
-                if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key) or \
-                        not isinstance(value, str) or not value.strip() or key.casefold() in seen:
-                    raise AssistantError("В списках разрешений нужны уникальные короткие имена и непустые пути.")
-                seen.add(key.casefold())
+            normalize_aliases(aliases)

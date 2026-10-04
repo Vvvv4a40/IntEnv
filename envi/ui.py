@@ -57,7 +57,6 @@ class EnviWindow:
         self._closing = False
         self._history: deque[str] = deque()
         self._history_size = 0
-        self._history_truncated = False
         self._after_id: str | None = None
         self._main_thread = threading.get_ident()
 
@@ -124,9 +123,11 @@ class EnviWindow:
         self._assert_main_thread()
         busy = self._kind is not None
         recording = self._kind == "audio" and self.recorder.is_recording
-        self.record_button.configure(text="Остановить запись" if recording else "Записать речь")
-        self.record_button.configure(state="normal" if self.has_api_key and
-                                     (not busy or recording and not self._record_stopping) else "disabled")
+        can_record = self.has_api_key and (not busy or recording and not self._record_stopping)
+        self.record_button.configure(
+            text="Остановить запись" if recording else "Записать речь",
+            state="normal" if can_record else "disabled",
+        )
         self.send_button.configure(state="disabled" if busy else "normal")
         self.input_box.configure(state="disabled" if busy else "normal")
         self.cancel_button.configure(state="normal" if busy and self._token and
@@ -139,14 +140,16 @@ class EnviWindow:
         entry = f"{datetime.now():%H:%M}  {speaker}: {message[:80_000]}\n\n"
         self._history.append(entry)
         self._history_size += len(entry)
-        if self._history_size > 100_000:
+        redraw = self._history_size > 100_000
+        if redraw:
             while len(self._history) > 1 and self._history_size > 80_000:
                 self._history_size -= len(self._history.popleft())
-            self._history_truncated = True
-        text = ("…предыдущие сообщения скрыты…\n\n" if self._history_truncated else "") + "".join(self._history)
         self.history_box.configure(state="normal")
-        self.history_box.delete("1.0", "end")
-        self.history_box.insert("1.0", text)
+        if redraw:
+            self.history_box.delete("1.0", "end")
+            self.history_box.insert("1.0", "…предыдущие сообщения скрыты…\n\n" + "".join(self._history))
+        else:
+            self.history_box.insert("end", entry)
         self.history_box.configure(state="disabled")
         self.history_box.see("end")
 
@@ -204,7 +207,10 @@ class EnviWindow:
             except Exception:
                 # Raw exceptions may contain provider responses or credentials.
                 self._queue.put(("error", generation, "Не удалось выполнить запрос. Проверьте настройки и повторите попытку."))
-        threading.Thread(target=run, name="EnviRequest", daemon=True).start()
+        try:
+            threading.Thread(target=run, name="EnviRequest", daemon=True).start()
+        except RuntimeError:
+            self._queue.put(("error", generation, "Не удалось запустить обработку запроса. Повторите попытку."))
 
     def _record(self) -> None:
         self._assert_main_thread()
@@ -286,29 +292,33 @@ class EnviWindow:
         except Exception:
             request.resolve(error=AssistantError("Не удалось проверить цель действия."))
             return
-        dialog = tk.Toplevel(self.root)
-        self._dialog = dialog
-        self._dialog_request = request
-        dialog.title("Подтверждение действия")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        box = ttk.Frame(dialog, padding=20)
-        box.pack(fill="both", expand=True)
-        ttk.Label(box, text="Разрешить Envi выполнить действие?", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        target_box = tk.Text(box, width=68, height=6, wrap="word", font=("Segoe UI", 10))
-        target_box.pack(fill="both", pady=12)
-        target_box.insert("1.0", f"{target}\n\nИнструмент: {request.call.name}")
-        target_box.configure(state="disabled")
-        row = ttk.Frame(box)
-        row.pack(anchor="e")
-        ttk.Button(row, text="Разрешить", command=lambda: self._finish_confirmation(True)).pack(side="left", padx=(0, 8))
-        deny = ttk.Button(row, text="Не разрешать", command=lambda: self._finish_confirmation(False))
-        deny.pack(side="left")
-        dialog.protocol("WM_DELETE_WINDOW", lambda: self._finish_confirmation(False))
-        dialog.bind("<Escape>", lambda _event: self._finish_confirmation(False))
-        dialog.bind("<Return>", lambda _event: self._finish_confirmation(False))
-        dialog.grab_set()
-        deny.focus_set()
+        try:
+            dialog = tk.Toplevel(self.root)
+            self._dialog = dialog
+            self._dialog_request = request
+            dialog.title("Подтверждение действия")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            box = ttk.Frame(dialog, padding=20)
+            box.pack(fill="both", expand=True)
+            ttk.Label(box, text="Разрешить Envi выполнить действие?", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            target_box = tk.Text(box, width=68, height=6, wrap="word", font=("Segoe UI", 10))
+            target_box.pack(fill="both", pady=12)
+            target_box.insert("1.0", f"{target}\n\nИнструмент: {request.call.name}")
+            target_box.configure(state="disabled")
+            row = ttk.Frame(box)
+            row.pack(anchor="e")
+            ttk.Button(row, text="Разрешить", command=lambda: self._finish_confirmation(True)).pack(side="left", padx=(0, 8))
+            deny = ttk.Button(row, text="Не разрешать", command=lambda: self._finish_confirmation(False))
+            deny.pack(side="left")
+            dialog.protocol("WM_DELETE_WINDOW", lambda: self._finish_confirmation(False))
+            dialog.bind("<Escape>", lambda _event: self._finish_confirmation(False))
+            dialog.bind("<Return>", lambda _event: self._finish_confirmation(False))
+            dialog.grab_set()
+            deny.focus_set()
+        except tk.TclError:
+            request.resolve(error=AssistantError("Не удалось показать подтверждение. Действие не выполнено."))
+            self._finish_confirmation(False)
 
     def _finish_confirmation(self, approved: bool = False) -> None:
         self._assert_main_thread()
@@ -316,11 +326,11 @@ class EnviWindow:
             self._dialog_request.resolve(approved)
         self._dialog_request = None
         if self._dialog is not None:
-            try:
-                self._dialog.grab_release()
-                self._dialog.destroy()
-            except tk.TclError:
-                pass
+            for operation in (self._dialog.grab_release, self._dialog.destroy):
+                try:
+                    operation()
+                except tk.TclError:
+                    pass
             self._dialog = None
 
     def _drop_confirmations(self) -> None:
@@ -348,7 +358,6 @@ class EnviWindow:
         self.assistant.clear_history()
         self._history.clear()
         self._history_size = 0
-        self._history_truncated = False
         self.history_box.configure(state="normal")
         self.history_box.delete("1.0", "end")
         self.history_box.configure(state="disabled")

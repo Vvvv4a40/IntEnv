@@ -152,6 +152,42 @@ class GroqTests(unittest.TestCase):
                     client.complete((ChatMessage("user", "hello"),), (), CancellationToken())
                 self.assertEqual(1, len(self.transport.requests))
 
+    def test_tool_calls_must_be_an_array_even_when_value_is_empty(self):
+        for calls in ({}, "", 0, False, {"call": "invalid"}):
+            with self.subTest(calls=calls):
+                client = self.client(chat_response("Hello", calls))
+                with self.assertRaises(AssistantError) as caught:
+                    client.complete((ChatMessage("user", "hello"),), (), CancellationToken())
+                self.assertIn("формата", str(caught.exception))
+                self.assertEqual(1, len(self.transport.requests))
+
+    def test_empty_or_null_tool_call_array_is_a_valid_text_reply(self):
+        for calls in (None, []):
+            with self.subTest(calls=calls):
+                body = {"choices": [{"message": {"content": "Hello", "tool_calls": calls}}]}
+                client = self.client(HttpResponse(200, json.dumps(body).encode("utf-8"), {}))
+                reply = client.complete((ChatMessage("user", "hello"),), (), CancellationToken())
+                self.assertEqual("Hello", reply.content)
+                self.assertEqual((), reply.tool_calls)
+
+    def test_duplicate_json_fields_and_nonstandard_constants_are_rejected(self):
+        bodies = (b'{"choices":[],"choices":[{"message":{"content":"Hello"}}]}',
+                  b'{"choices":[{"message":{"content":"Hello","tool_calls":NaN}}]}')
+        for body in bodies:
+            with self.subTest(body=body):
+                client = self.client(HttpResponse(200, body, {}))
+                with self.assertRaises(AssistantError):
+                    client.complete((ChatMessage("user", "hello"),), (), CancellationToken())
+
+    def test_cancelled_transcription_stops_before_audio_validation_and_quota(self):
+        token = CancellationToken()
+        token.cancel()
+        client = self.client()
+        with self.assertRaises(CancelledError):
+            client.transcribe(b"invalid WAV", token)
+        self.assertEqual([], self.transport.requests)
+        self.assertEqual(0, client.session_api_requests)
+
     def test_http_auth_and_server_errors_do_not_retry(self):
         for status in (401, 403, 500, 503):
             with self.subTest(status=status):

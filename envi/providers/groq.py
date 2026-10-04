@@ -47,9 +47,22 @@ class StandardHttpTransport:
         deadline = time.monotonic() + timeout_seconds
         connection = http.client.HTTPSConnection("api.groq.com", timeout=timeout_seconds,
                                                  context=ssl.create_default_context())
-        connection.auto_open = False  # Never reconnect implicitly after cancellation/timeout closes the socket.
+        connection.auto_open = False
         active_socket: list[socket.socket | None] = [None]
         deadline_expired = Event()
+        response: http.client.HTTPResponse | None = None
+
+        def check_deadline() -> float:
+            token.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or deadline_expired.is_set():
+                raise TimeoutError()
+            return remaining
+
+        def prepare_io() -> None:
+            remaining = check_deadline()
+            if active_socket[0] is not None:
+                active_socket[0].settimeout(remaining)
 
         def interrupt() -> None:
             current_socket = active_socket[0]
@@ -67,32 +80,20 @@ class StandardHttpTransport:
         unregister = token.register(interrupt)
         timer = Timer(timeout_seconds, expire)
         timer.daemon = True
-        timer.start()
         try:
+            timer.start()
+            check_deadline()
             connection.connect()
             active_socket[0] = connection.sock
-            token.check()
-            if deadline_expired.is_set():
-                raise TimeoutError()
-            if connection.sock is not None:
-                connection.sock.settimeout(max(0.001, deadline - time.monotonic()))
+            prepare_io()
             connection.request("POST", target.path, body=bodybytes, headers=headers)
-            token.check()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or deadline_expired.is_set():
-                raise TimeoutError()
-            if connection.sock is not None:
-                connection.sock.settimeout(remaining)
+            prepare_io()
             response = connection.getresponse()
             chunks = bytearray()
             while True:
-                token.check()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError()
-                if active_socket[0] is not None:
-                    active_socket[0].settimeout(remaining)
+                prepare_io()
                 chunk = response.read1(8192)
+                check_deadline()
                 if not chunk:
                     break
                 if len(chunks) + len(chunk) > _MAX_RESPONSE_BYTES:
@@ -110,7 +111,11 @@ class StandardHttpTransport:
         finally:
             timer.cancel()
             unregister()
-            connection.close()
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()
 
 
 class GroqClient:
@@ -128,6 +133,7 @@ class GroqClient:
 
     def complete(self, messages: Sequence[ChatMessage], schemas: Sequence[dict[str, Any]],
                  token: CancellationToken) -> ModelReply:
+        token.check()
         body: dict[str, Any] = {
             "model": self.settings.chat_model,
             "messages": [self._wire_message(message) for message in messages],
@@ -139,19 +145,41 @@ class GroqClient:
             body["reasoning_effort"] = "low"
         response = self._send("chat/completions", json.dumps(body, ensure_ascii=False).encode("utf-8"),
                               "application/json", token)
+        return self._parse_reply(response)
+
+    @staticmethod
+    def _parse_reply(response: bytes) -> ModelReply:
         try:
             root = strict_json_loads(response.decode("utf-8"))
-            choice = root["choices"][0]
-            message = choice["message"]
+            if not isinstance(root, dict):
+                raise ValueError()
+            choices = root.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ValueError()
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise ValueError()
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise ValueError()
             content = message.get("content")
             finish_reason = choice.get("finish_reason")
             if content is not None and not isinstance(content, str):
                 raise ValueError()
             if finish_reason is not None and not isinstance(finish_reason, str):
                 raise ValueError()
+            wire_calls = message.get("tool_calls")
+            if wire_calls is None:
+                wire_calls = []
+            if not isinstance(wire_calls, list):
+                raise ValueError()
             calls = []
-            for call in message.get("tool_calls") or ():
-                function = call["function"]
+            for call in wire_calls:
+                if not isinstance(call, dict):
+                    raise ValueError()
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    raise ValueError()
                 if call["type"] != "function" or any(not isinstance(value, str) for value in
                                                       (call["id"], function["name"], function["arguments"])):
                     raise ValueError()
@@ -161,6 +189,7 @@ class GroqClient:
             raise AssistantError("Groq вернул ответ неожиданного формата. Действия из этого ответа не выполнены.") from error
 
     def transcribe(self, wavbytes: bytes, token: CancellationToken) -> str:
+        token.check()
         self._validate_wav(wavbytes)
         boundary = "envi-" + uuid.uuid4().hex
         pieces: list[bytes] = []

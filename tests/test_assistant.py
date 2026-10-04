@@ -1,6 +1,8 @@
 """Coordinator safety/state tests. No operating-system effects are performed."""
 
 import unittest
+from concurrent.futures import Future
+from threading import Event, Thread
 
 from envi.assistant import AssistantService
 from envi.cancellation import CancellationToken
@@ -33,6 +35,19 @@ class AssistantTests(unittest.TestCase):
 
     def reject_approval(self, call):
         self.fail("Unexpected approval: " + call.name)
+
+    def start_request(self, service, question, token=None):
+        outcome = Future()
+
+        def run():
+            try:
+                outcome.set_result(service.process(question, self.reject_approval, token or CancellationToken()))
+            except Exception as error:
+                outcome.set_exception(error)
+
+        thread = Thread(target=run, daemon=True)
+        thread.start()
+        return thread, outcome
 
     def test_local_time_never_calls_model_or_confirmation(self):
         service = self.service()
@@ -266,6 +281,92 @@ class AssistantTests(unittest.TestCase):
                 with self.assertRaises(AssistantError):
                     service.process("Сложный вопрос", self.reject_approval, CancellationToken())
                 self.assertEqual((), service.get_history_snapshot())
+
+    def test_failed_turn_releases_lock_and_does_not_pollute_history(self):
+        model = FakeModel(AssistantError("Fake failure"), ModelReply("Recovered"))
+        service = self.service(model)
+        with self.assertRaises(AssistantError):
+            service.process("Failed question", self.reject_approval, CancellationToken())
+        self.assertEqual("Recovered", service.process("Next question", self.reject_approval, CancellationToken()))
+        self.assert_history(service, "Next question", "Recovered")
+
+    def test_unexpected_error_after_action_reports_effect_without_details(self):
+        tools = FakeToolRegistry()
+        model = FakeModel(reply_with(ToolCall("open_app", '{"app":"notepad"}', "app")),
+                          RuntimeError("SECRET_PROVIDER_DETAILS"))
+        service = self.service(model, tools=tools)
+        answer = service.process("Do an action then fail", lambda call: True, CancellationToken())
+        self.assertIn("Ошибка обработки запроса", answer)
+        self.assertNotIn("SECRET", answer)
+        self.assertEqual(1, answer.count(tools.result))
+        self.assert_history(service, "Do an action then fail", answer)
+
+    def test_concurrent_turns_preserve_serial_history(self):
+        entered, release = Event(), Event()
+        model = FakeModel(ModelReply("First answer"), ModelReply("Second answer"))
+        complete = model.complete
+
+        def blocking_complete(messages, schemas, token):
+            reply = complete(messages, schemas, token)
+            if len(model.calls) == 1:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("First request was not released")
+            return reply
+
+        model.complete = blocking_complete
+        service = self.service(model)
+        first, first_outcome = self.start_request(service, "First question")
+        second = None
+        try:
+            self.assertTrue(entered.wait(2))
+            second, second_outcome = self.start_request(service, "Second question")
+            self.assertEqual(1, len(model.calls))
+            release.set()
+            self.assertEqual("First answer", first_outcome.result(2))
+            self.assertEqual("Second answer", second_outcome.result(2))
+            self.assertEqual(["First question", "First answer", "Second question"],
+                             [message.content for message in model.calls[1][0][1:]])
+            self.assertEqual(["First question", "First answer", "Second question", "Second answer"],
+                             [message.content for message in service.get_history_snapshot()])
+        finally:
+            release.set()
+            first.join(2)
+            if second is not None:
+                second.join(2)
+
+    def test_waiting_turn_can_cancel_without_calling_model(self):
+        entered, release = Event(), Event()
+        model = FakeModel(ModelReply("First answer"))
+        complete = model.complete
+
+        def blocking_complete(messages, schemas, token):
+            reply = complete(messages, schemas, token)
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("First request was not released")
+            return reply
+
+        model.complete = blocking_complete
+        service = self.service(model)
+        first, first_outcome = self.start_request(service, "First question")
+        second = None
+        try:
+            self.assertTrue(entered.wait(2))
+            token = CancellationToken()
+            second, second_outcome = self.start_request(service, "Cancelled question", token)
+            token.cancel()
+            with self.assertRaises(CancelledError):
+                second_outcome.result(2)
+            release.set()
+            self.assertEqual("First answer", first_outcome.result(2))
+            self.assertEqual(1, len(model.calls))
+            self.assert_history(service, "First question", "First answer")
+        finally:
+            release.set()
+            first.join(2)
+            if second is not None:
+                second.join(2)
 
 
 if __name__ == "__main__":
