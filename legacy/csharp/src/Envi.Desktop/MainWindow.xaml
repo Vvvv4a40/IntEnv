@@ -1,0 +1,46 @@
+<Window x:Class="Envi.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Envi" Width="900" Height="620" MinWidth="620" MinHeight="440"
+        WindowStartupLocation="CenterScreen" Background="#F5F7FA">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+            <TextBlock Text="Envi" FontSize="25" FontWeight="SemiBold" Foreground="#17263C" />
+            <TextBlock x:Name="ApiCountText" HorizontalAlignment="Right" VerticalAlignment="Center"
+                       Foreground="#536479" />
+        </Grid>
+        <TextBlock Grid.Row="1" x:Name="StatusText" Margin="0,4,0,14"
+                   TextWrapping="Wrap" Foreground="#536479" />
+
+        <Border Grid.Row="2" Background="White" BorderBrush="#D6DFE9"
+                BorderThickness="1" CornerRadius="8" Padding="12">
+            <TextBox x:Name="HistoryBox" IsReadOnly="True" BorderThickness="0"
+                     Background="Transparent" TextWrapping="Wrap" AcceptsReturn="True"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" />
+        </Border>
+
+        <TextBox Grid.Row="3" x:Name="InputBox" Margin="0,14,0,10" MinHeight="74"
+                 Padding="10" TextWrapping="Wrap" AcceptsReturn="True"
+                 VerticalScrollBarVisibility="Auto" PreviewKeyDown="InputBox_PreviewKeyDown"
+                 ToolTip="Введите запрос. Ctrl+Enter — отправить." />
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="RecordButton" Content="Записать речь" Width="130" Height="34"
+                    Margin="0,0,8,0" Click="RecordButton_Click" />
+            <Button x:Name="SendButton" Content="Отправить" Width="110" Height="34"
+                    Margin="0,0,8,0" Click="SendButton_Click" />
+            <Button x:Name="CancelButton" Content="Отмена" Width="90" Height="34"
+                    Margin="0,0,8,0" Click="CancelButton_Click" />
+            <Button x:Name="ClearButton" Content="Очистить окно" Width="120" Height="34"
+                    Click="ClearButton_Click" />
+        </StackPanel>
+    </Grid>
+</Window>

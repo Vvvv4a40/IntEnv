@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Envi.Core\Envi.Core.csproj" />
+    <None Include="..\..\envi.settings.json" Link="envi.settings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

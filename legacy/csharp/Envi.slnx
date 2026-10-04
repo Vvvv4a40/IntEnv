@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Envi.Core/Envi.Core.csproj" />
+    <Project Path="src/Envi.Desktop/Envi.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Envi.Tests/Envi.Tests.csproj" />
+  </Folder>
+</Solution>
